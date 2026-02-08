@@ -531,6 +531,7 @@ class Trader:
         self.opinion = 0.0
         self.input = 0.0
         self.attention = 0.0
+        self.time_horizon = 0.0
 
 
     def __str__(self):
@@ -1823,6 +1824,14 @@ def populate_market(trdrs_spec, traders, shuffle, vrbs):
 
         return parameters
 
+
+    def sample_L_powerlaw(n_traders, Lmin, Lmax, alpha, rng=1):
+        rng = np.random.default_rng(rng) # given a seed for repeatability
+        L = np.arange(Lmin, Lmax + 1)  # possible window lengths
+        w = L ** (-alpha)  # power-law weights
+        p = w / w.sum()  # normalize
+        return rng.choice(L, size=n_traders, p=p)
+
     landscape_mapping = False  # set to true when mapping fitness landscape (for PRSH etc).
 
     # the code that follows is a bit of a kludge, needs tidying up.
@@ -1893,7 +1902,12 @@ def populate_market(trdrs_spec, traders, shuffle, vrbs):
         for t in range(n_proptraders):
             tname = 'P%02d' % t
             print(traders[tname])
-
+    n_traders = n_sellers + n_buyers
+    possible_windows = sample_L_powerlaw(n_traders=1000, Lmin=5, Lmax=500, alpha=1.5, rng=0)
+    i = 0
+    for trdr in traders:
+        traders[trdr].time_horizon = possible_windows[i]
+        i += 1
     return {'n_buyers': n_buyers, 'n_sellers': n_sellers, 'n_proptraders': n_proptraders}
 
 
