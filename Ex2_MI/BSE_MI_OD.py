@@ -185,7 +185,7 @@ class OrderbookHalf:
         if (self.booktype == 'Ask') and ((self.session_extreme is None) or (order.price > self.session_extreme)):
             self.session_extreme = int(order.price)
 
-        if (self.booktype == 'Bid') and ((self.session_extreme_bid is None) or (order.price < self.session_extreme_bid)):
+        if (self.booktype == 'Bid') and ((self.session_extreme_bid is None) or (order.price > self.session_extreme_bid)):
             self.session_extreme_bid = int(order.price)
 
         # add the order to the book
@@ -838,7 +838,7 @@ class TraderPRZI(Trader):
         :param time: the current time.
         """
 
-        vrbs = True
+        vrbs = False
         verbose = False
         Trader.__init__(self, ttype, tid, balance, params, time)
 
@@ -877,6 +877,9 @@ class TraderPRZI(Trader):
         self.strats = []  # strategies awaiting initialization
         self.pmax = None  # this trader's estimate of the maximum price the market will bear
         self.pmax_c_i = math.sqrt(random.randint(1, 10))  # multiplier coefficient when estimating p_max
+
+        self.pmin = None  # this trader's estimate of the maximum price the market will bear
+        self.pmin_c_i = pow((random.randint(1, 10)),2)# divider coefficient when estimating p_min to bes set later
         self.mapper_outfile = None
         # differential evolution parameters all in one dictionary
         self.diffevol = {'de_state': 'active_s0',  # initial state: strategy 0 is active (being evaluated)
@@ -1125,6 +1128,7 @@ class TraderPRZI(Trader):
 
             # trader's individual estimate highest price the market will bear
             maxprice = self.pmax  # default assumption
+
             if self.pmax is None:
                 maxprice = int(limit * self.pmax_c_i + 0.5)  # in the absence of any other info, guess
                 self.pmax = maxprice
@@ -1132,6 +1136,9 @@ class TraderPRZI(Trader):
                 if self.pmax < lob['asks']['sess_hi']:  # some other trader has quoted higher than I expected
                     maxprice = lob['asks']['sess_hi']  # so use that as my new estimate of highest
                     self.pmax = maxprice
+
+
+
 
             # use the cdf look-up table
             # cdf_lut is a list of little dictionaries
@@ -2112,12 +2119,6 @@ def customer_orders(time, traders, trader_stats, orders_sched, pending, vrbs):
             order = Order(tname, ordertype, orderprice, 1, issuetime, chrono.time())
             new_pending.append(order)
 
-
-
-
-
-
-
         # supply side (sellers)
         issuetimes = getissuetimes(n_sellers, orders_sched['timemode'], orders_sched['interval'], shuffle_times, True)
         ordertype = 'Ask'
@@ -2213,7 +2214,7 @@ def opinion_dynamics(u_low, u_high, gamma, A, B, N, X0, U0):
 
         return dState
 
-    U0 = np.zeros(N)
+
 
     State = np.concatenate((X0, U0))
     ds = cds(equations_of_motion=BFL, system_dimension=2 * N, number_of_parameters=0)
@@ -2225,11 +2226,18 @@ def opinion_dynamics(u_low, u_high, gamma, A, B, N, X0, U0):
     # Generate the trajectory
     trajectory = ds.trajectory(State, total_time)
 
-    trag_df = pd.DataFrame(trajectory)
-    final_x = list(trag_df.iloc[0, 1:N + 1])
-    final_u = list(trag_df.iloc[0, N + 1:2 * N + 1])
+    # Convert to array if not already
+    trajectory_array = np.array(trajectory)
 
+    # Get the last row
+    final = trajectory_array[-1]
+
+    # Extract final_x and final_u from slices
+    final_x = final[1:N + 1]
+    final_u = final[N + 1:2 * N + 1]
     return final_x, final_u
+
+
 
 
 
@@ -2251,20 +2259,7 @@ def market_session(sess_id, starttime, endtime, trader_spec, order_schedule, dum
     # --------------------------- Inputs                 -------------------------------------------------------------#
     # ----------------------------------------------------------------------------------------------------------------#
     def get_input1(traders, lob, tid_to_i):
-        prices = []
-
-        B = np.zeros(len(tid_to_i), dtype=int)
-
-        # opinion_dynamics is called on each iteration of the market_session main loop when there is an order issued
-        # (i.e. up to n_traders times per second)
-        # this frequency makes sense for global opinion (because LOB could change multiple times per second)
-        # but for local opinion a realistic rate of interaction (among humans at least) would be slower than that
-        # so pr_activity is probability of *any* local OD activity per call
-
-        # global opinion dynamics: form an opinion by looking at the LOB
-        # do we have orders resting at top of both sides of LOB?
-
-
+        B = np.zeros(len(tid_to_i), dtype=np.float64)
 
         if lob['bids']['best'] is not None and lob['asks']['best'] is not None:
             # top of LOB has prices on both sides
@@ -2278,11 +2273,19 @@ def market_session(sess_id, starttime, endtime, trader_spec, order_schedule, dum
             total_q = lob_best_bid_q + lob_best_ask_q
             microprice = ((lob_best_bid_p * lob_best_ask_q) + (lob_best_ask_p * lob_best_bid_q)) / total_q
 
-            delta_p_norm = microprice - midprice
+            delta_p = microprice - midprice
+
+            spread = lob_best_ask_p - lob_best_bid_p
+            if spread != 0.0:
+                delta_p_norm = 2.0 * delta_p / spread
+            else:
+                delta_p_norm = 0.0
+
+
 
             verbose = False
             if verbose:
-                print('t=%f, OpDyn-global: LOB top: bq=%f bp=%f ap=%f aq=%f; mid=%f micro=%f delta_p_norm=%f' % \
+                print('t=%f,LOB top: bq=%f bp=%f ap=%f aq=%f; mid=%f micro=%f delta_p_norm=%f' % \
                       (time, lob_best_bid_q, lob_best_bid_p, lob_best_ask_p, lob_best_ask_q, midprice, microprice,
                        delta_p_norm))
         else:
@@ -2295,14 +2298,14 @@ def market_session(sess_id, starttime, endtime, trader_spec, order_schedule, dum
             #    buy/sell wiped out one side of the LOB, that's a potential sign of major sup/dem imbalance
             #    in which case delta_p_norm could more usefully be set to plus or minus one.
 
-        input = np.tanh(delta_p_norm)
+        input_b = delta_p_norm
 
         for tid in traders:
             i = tid_to_i[tid]
-            B[i] = input
-            traders[tid].input = input
+            B[i] = input_b
+            traders[tid].input = input_b
 
-        return np.array(B, dtype=np.float64)
+        return B
 
     # ----------------------------------------------------------------------------------------------------------------#
     # ----------------------------------------------------------------------------------------------------------------#
@@ -2359,7 +2362,7 @@ def market_session(sess_id, starttime, endtime, trader_spec, order_schedule, dum
             trader = trdrs[trdr]
 
             # print('PRSH/PRDE/ZIPSH strategy recording, t=%s' % trader)
-            if trader.ttype == 'PRSH' or trader.ttype == 'PRDE' or trader.ttype == 'ZIPSH':
+            if trader.ttype in ['PRSH', 'PRDE', 'OPRDE', 'PRZI', 'ZIPSH']:
                 line_str += 'id=,%s, %s,' % (trader.tid, trader.ttype)
 
                 if trader.ttype == 'ZIPSH':
@@ -2403,7 +2406,9 @@ def market_session(sess_id, starttime, endtime, trader_spec, order_schedule, dum
             print('line_str: %s' % line_str)
         stratfile.write(line_str)
         stratfile.flush()
-        os.fsync(stratfile)
+        os.fsync(stratfile.fileno())
+
+
 
     def dump_prde_population_one_trader(frametime, stratfile, traders, trader_id):
         """
@@ -2437,7 +2442,7 @@ def market_session(sess_id, starttime, endtime, trader_spec, order_schedule, dum
 
         stratfile.write(line)
         stratfile.flush()
-        os.fsync(stratfile)
+        os.fsync(stratfile.fileno())
 
     def blotter_dump(session_id, trdrs):
         """
@@ -2467,7 +2472,7 @@ def market_session(sess_id, starttime, endtime, trader_spec, order_schedule, dum
 
 
     orders_verbose = False
-    lob_verbose = True
+    lob_verbose = False
     process_verbose = False
     respond_verbose = False
     bookkeep_verbose = False
@@ -2505,11 +2510,13 @@ def market_session(sess_id, starttime, endtime, trader_spec, order_schedule, dum
     traders = {}
     trader_stats = populate_market(trader_spec, traders, True, populate_verbose)
 
-    # create files and write headers (once)
-    for trdr in traders.keys():
+    one_trader_files = {}
+
+    """for trdr in traders.keys():
         filename = f"{sess_id}f_one_trader_strats_{trdr}.csv"
-        with open(filename, "w") as one_strat_dump:
-            one_strat_dump.write("time,s0,s1,s2,s3,s_new,opinion_s\n")
+        f = open(filename, "w", buffering=1)  # line-buffered
+        f.write("time,s0,s1,s2,s3,s_new,opinion_s\n")
+        one_trader_files[trdr] = f"""
 
     # timestep set so that can process all traders in one second
     # NB minimum interarrival time of customer orders may be much less than this!!
@@ -2534,139 +2541,127 @@ def market_session(sess_id, starttime, endtime, trader_spec, order_schedule, dum
         groups_time_horizon[L].append(trdr)
     tids = list(traders.keys())
     tid_to_i = {tid: i for i, tid in enumerate(tids)}
-    print("tid_to_i", tid_to_i)
+    #print("tid_to_i", tid_to_i)
     N = trader_stats['n_buyers'] + trader_stats['n_sellers']
     gamma = 1
-    X0 = np.zeros(N)
-    U0 = np.zeros(N)
-    B = np.zeros(N)
+
+
+
     u_low, u_high, A = network_spectral_properties(N, gamma)
-    last_updated_day = 0
+
     # ----------------------------------------------------------------------------------------------------------------#
     # ----------------------------------------------------------------------------------------------------------------#
+    shock_done = False
+    last_sec_strats = 0.0
     while time < endtime:
+        B1 = np.zeros(N)
+        X0 = np.zeros(N)
+        U0 = np.zeros(N)
+
+        for tid in traders:
+            i = tid_to_i[tid]
+            traders[tid].input = B1[i]
+        """============================inject the market with a large bid order===== """
+        if (time >= 60 * 60.0) and (time <= 60 * 90.0):
+            if (not shock_done):
+                lob = exchange.publish_lob(time, lobframes, lob_verbose)
+
+                bb = lob['bids']['best']
+                ba = lob['asks']['best']
+
+                if (bb is not None) and (ba is not None) and (bb < ba):
+                    # seller-side shock: become new best ask without crossing
+                    block_price = ba - 1
+                    if block_price < 60:
+                        block_price = 60
+
+                    if block_price <= bb:
+                        block_price = ba
+                    block_order = Order('S00', 'Ask', block_price, 300, time, chrono.time())
+                    traders['S00'].add_order(block_order, verbose)
+
+                    # force the quote to the exchange at top-of-book
+                    forced_quote = Order('S00', 'Ask', block_price, 300, time, chrono.time())
+                    exchange.add_order(forced_quote, verbose)
+
+                    lob = exchange.publish_lob(time, lobframes, lob_verbose)
+                    print("ASSIGNMENT:", traders['S00'].orders[0])
+
+                    B1 = get_input1(traders, lob, tid_to_i)
+                    shock_done = True
+
+            if int(time) not in frames_done:
+
+                X, U = opinion_dynamics(u_low, u_high, gamma, A, B1, N, X0, U0)
+                X0 = X
+                U0 = U
+                for trd in traders:
+                    i = tid_to_i[trd]
+                    traders[trd].opinion = X[i]
+                    traders[trd].attention = U[i]
+
+                dump_opinions(time, opinion_dump, traders)
+                frames_done.add(int(time))
+
+        """============================End inject the market with a large bid order===== """
+
 
         # how much time left, as a percentage?
         time_left = (endtime - time) / session_duration
 
 
-        if sess_vrbs:
-            print('\n\n%s; t=%08.2f (%4.1f/100) ' % (sess_id, time, time_left * 100))
-
         [pending_cust_orders, kills] = customer_orders(time, traders, trader_stats,
                                                        order_schedule, pending_cust_orders, orders_verbose)
 
-        # if any newly-issued customer orders mean quotes on the LOB need to be cancelled, kill them
         if len(kills) > 0:
-            # if verbose : print('Kills: %s' % (kills))
             for kill in kills:  # indexed by trader ID
-                # if verbose : print('lastquote=%s' % traders[kill].lastquote)
                 if traders[kill].lastquote is not None:
-                    # if verbose : print('Killing order %s' % (str(traders[kill].lastquote)))
-                    # NB if exchange.del_order() third argument = None then cancellations not written to tape file.
-                    # exchange.del_order(time, traders[kill].lastquote, tape_dump, sess_vrbs)
                     exchange.del_order(time, traders[kill].lastquote, None, sess_vrbs)
 
-        # get a limit-order quote (or None) from a randomly chosen trader
         tid = list(traders.keys())[random.randint(0, len(traders) - 1)]
-
         order = traders[tid].getorder(time, time_left, exchange.publish_lob(time, lobframes, lob_verbose))
-
-
-        if sess_vrbs:
-            print('trader=%s order=%s' % (tid, order))
 
         if order is not None:
             if order.otype == 'Ask' and order.price < traders[tid].orders[0].price:
                 sys.exit('Bad ask')
             if order.otype == 'Bid' and order.price > traders[tid].orders[0].price:
                 sys.exit('Bad bid')
-            # send order to exchange
+
             traders[tid].n_quotes = 1
             trade = exchange.process_order(time, order, tape_dump, process_verbose)
             if trade is not None:
-                # trade occurred,
-                # so the counterparties update order lists and blotters
                 traders[trade['party1']].bookkeep(time, trade, order, bookkeep_verbose)
                 traders[trade['party2']].bookkeep(time, trade, order, bookkeep_verbose)
                 if dumpfile_flags['dump_avgbals']:
                     trade_stats(sess_id, traders, avg_bals, time, exchange.publish_lob(time, lobframes, lob_verbose))
 
-            # traders respond to whatever happened
+
             lob = exchange.publish_lob(time, lobframes, lob_verbose)
-            """============================inject the market with a large bid order===== """
-            # somewhere before the loop
-            shock_done = False
-
-            if (not shock_done) and (time >= 60.0) and (time <= 80.0) :
-                bb = lob['bids']['best']  # best bid price (or None)
-                ba = lob['asks']['best']  # best ask price (or None)
-
-                # only inject if we actually have a spread
-                if (bb is not None) and (ba is not None) and (bb < ba):
-                    # choose a price that sits at the top of bids but does NOT cross
-                    # simplest: 1 tick above best bid, but capped to stay below best ask
-                    block_price = min(bb + 1, ba - 1)
-
-                    # if spread is only 1 tick wide, bb+1 == ba, can't place inside spread
-                    # then just sit at best bid
-                    if block_price >= ba:
-                        block_price = bb
-
-                    # IMPORTANT: this is a CUSTOMER ORDER for B00 (limit price = block_price)
-                    block_order = Order('B00', 'Bid', block_price, 300, time, chrono.time())
-                    traders['B00'].add_order(block_order, verbose)
 
 
-                    # force the quote to the exchange at top-of-book
-                    forced_quote = Order('B00', 'Bid', block_price, 300, time, chrono.time())
-                    exchange.add_order(forced_quote, verbose)
-
-                    print("ASSIGNMENT:", traders['B00'].orders[0])
-                    q = traders['B00'].getorder(time, time_left, lob)
-                    print("QUOTE:", q)
-                    shock_done = True
-
-            """============================inject the market with a large bid order===== """
-            any_record_frame = True
             for t in traders:
-                # NB respond just updates trader's internal variables
-                # doesn't alter the LOB, so processing each trader in
-                # sequence (rather than random/shuffle) isn't a problem
-                record_frame = traders[t].respond(time, lob, trade, respond_verbose)
-                if record_frame:
-                    any_record_frame = True
+                traders[t].respond(time, lob, trade, respond_verbose)
 
-            # log all the PRSH/PRDE/ZIPSH strategy info for this timestep?
-            if any_record_frame and dumpfile_flags['dump_strats']:
-                # print one more frame to strategy dumpfile
+            sec = int(time)
+            if dumpfile_flags['dump_strats'] and sec != last_sec_strats:
                 dump_strats_frame(time, strat_dump, traders)
-                # record that we've written this frame
-                frames_done.add(int(time))
+                last_sec_strats = sec
 
-            B1 = get_input1(traders, lob, tid_to_i)  # market impact
-            print(B1)
-            B2 = get_input2(traders, exchange.tape, groups_time_horizon, tid_to_i)  #time horizon
+
             # ------------------------------------------------------------------------------------------------------------#
             # ----------------------------------Update Opinions Once Every Day -------------------------------------------#
 
-            X, U = opinion_dynamics(u_low, u_high, gamma, A, B1, N, X0, U0)
+            if int(time) not in frames_done:
+                X, U = opinion_dynamics(u_low, u_high, gamma, A, B1, N, X0, U0)
 
-            X0 = X
-            U0 = U
-            for trd in traders:
-                i = tid_to_i[trd]
-                traders[trd].opinion = X[i]
-                traders[trd].attention = U[i]
+                for trd in traders:
+                    i = tid_to_i[trd]
+                    traders[trd].opinion = X[i]
+                    traders[trd].attention = U[i]
 
-            dump_opinions(time, opinion_dump, traders)
+                dump_opinions(time, opinion_dump, traders)
+                frames_done.add(int(time))
 
-        # periodically append data
-
-        for trdr in traders.keys():
-            filename = f"{sess_id}f_one_trader_strats_{trdr}.csv"
-            with open(filename, "a") as one_strat_dump:
-                dump_prde_population_one_trader(time, one_strat_dump, traders, trader_id=trdr)
 
         time = time + timestep
 
@@ -2690,7 +2685,8 @@ def market_session(sess_id, starttime, endtime, trader_spec, order_schedule, dum
     if dumpfile_flags['dump_opinions']:
         opinion_dump.close()
 
-
+    for f in one_trader_files.values():
+        f.close()
 
 
 #############################
@@ -2706,10 +2702,10 @@ if __name__ == "__main__":
 
     # set up common parameters for all market sessions
     # 1000 days is often good, but 3*365=1095, so may as well go for three years.
-    n_seconds = 150
+    n_minutes = 150
     hours_in_a_day = 24  # how many hours the exchange operates for in a working day (e.g. NYSE = 7.5)
     start_time = 0.0
-    end_time = n_seconds
+    end_time = 60 * n_minutes
     duration = end_time - start_time
 
 
@@ -2861,8 +2857,8 @@ if __name__ == "__main__":
     #    offsetfn_events = schedule_offsetfn_read_file(price_offset_filename, 0, 1)
 
     args = [1]
-    range1 = (85, 115)
-    range2 = (85, 115)
+    range1 = (60, 60)
+    range2 = (140, 140)
 
     # supply schedule (defines the supply curve)
     # range1 = (75, 110, (schedule_offsetfn_from_eventlist, [[end_time, offsetfn_events]]))
@@ -2873,7 +2869,7 @@ if __name__ == "__main__":
     demand_schedule = [{'from': start_time, 'to': end_time, 'ranges': [range2], 'stepmode': 'fixed'}]
 
     # new customer orders arrive at each trader approx once every order_interval seconds
-    order_interval = 20
+    order_interval = 5
 
     # order schedule wraps up the supply/demand schedules and details of how customer orders/assignments are issued
     order_sched = {'sup': supply_schedule, 'dem': demand_schedule,
@@ -2895,10 +2891,10 @@ if __name__ == "__main__":
     while trial < (n_trials + 1):
 
         # create unique i.d. string for this trial
-        trial_id = 'bse_sec%03d_i%02d_%04d' % (n_seconds, order_interval, trial)
+        trial_id = 'bse_MI_min%03d_i%02d_%04d' % (n_minutes, order_interval, trial)
 
         # buyer_spec specifies the strategies played by buyers, and for each strategy how many such buyers to create
-        buyers_spec = [('OPRDE', 3, {'k': 4, 's_min': -1.0, 's_max': +1.0})]
+        buyers_spec = [('OPRDE', 30, {'k': 4, 's_min': -1.0, 's_max': +1.0})]
         #     ('PRZI', 5, {'s_min': -1.0, 's_max': +1.0})]
 
         # seller_spec specifies the strategies played by sellers, and for each strategy how many such sellers to create
@@ -2916,8 +2912,8 @@ if __name__ == "__main__":
                           'dump_avgbals': False, 'dump_tape': False, 'dump_opinions': False}
         else:
             # we're still recording all the required data-files
-            dump_flags = {'dump_blotters': True, 'dump_lobs': True, 'dump_strats': True,
-                          'dump_avgbals': True, 'dump_tape': True, 'dump_opinions': True}
+            dump_flags = {'dump_blotters': False, 'dump_lobs': True, 'dump_strats': True,
+                          'dump_avgbals': False, 'dump_tape': True, 'dump_opinions': True}
 
         # simulate the market session
         market_session(trial_id, start_time, end_time, traders_spec, order_sched, dump_flags, verbose)
