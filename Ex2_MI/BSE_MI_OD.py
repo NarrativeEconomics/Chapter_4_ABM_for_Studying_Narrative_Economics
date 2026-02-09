@@ -866,7 +866,7 @@ class TraderPRZI(Trader):
         self.k = k  # number of sampling points (cf number of arms on a multi-armed-bandit, or pop-size)
         self.theta0 = 100  # threshold-function limit value
         self.m = 4  # tangent-function multiplier
-        self.strat_wait_time = 1  # how many secs do we give any one strat before switching?
+        self.strat_wait_time = 5 # how many secs do we give any one strat before switching?
         self.strat_range_min = s_min  # lower-bound on randomly-assigned strategy-value
         self.strat_range_max = s_max  # upper-bound on randomly-assigned strategy-value
         self.active_strat = 0  # which of the k strategies are we currently playing? -- start with 0
@@ -2221,7 +2221,7 @@ def opinion_dynamics(u_low, u_high, gamma, A, B, N, X0, U0):
     ds.integrator("rk4", time_step=0.01)
 
     # The total evolution time
-    total_time = 5
+    total_time = 1
 
     # Generate the trajectory
     trajectory = ds.trajectory(State, total_time)
@@ -2553,10 +2553,10 @@ def market_session(sess_id, starttime, endtime, trader_spec, order_schedule, dum
     # ----------------------------------------------------------------------------------------------------------------#
     shock_done = False
     last_sec_strats = 0.0
+
     while time < endtime:
         B1 = np.zeros(N)
-        X0 = np.zeros(N)
-        U0 = np.zeros(N)
+
 
         for tid in traders:
             i = tid_to_i[tid]
@@ -2651,16 +2651,18 @@ def market_session(sess_id, starttime, endtime, trader_spec, order_schedule, dum
             # ------------------------------------------------------------------------------------------------------------#
             # ----------------------------------Update Opinions Once Every Day -------------------------------------------#
 
-            if int(time) not in frames_done:
-                X, U = opinion_dynamics(u_low, u_high, gamma, A, B1, N, X0, U0)
+        if int(time%60) == 0 and int(time) not in frames_done:
+            X0 = np.zeros(N)
+            U0 = np.zeros(N)
+            X, U = opinion_dynamics(u_low, u_high, gamma, A, B1, N, X0, U0)
+            print("time", time)
+            for trd in traders:
+                i = tid_to_i[trd]
+                traders[trd].opinion = X[i]
+                traders[trd].attention = U[i]
 
-                for trd in traders:
-                    i = tid_to_i[trd]
-                    traders[trd].opinion = X[i]
-                    traders[trd].attention = U[i]
-
-                dump_opinions(time, opinion_dump, traders)
-                frames_done.add(int(time))
+            dump_opinions(time, opinion_dump, traders)
+            frames_done.add(int(time))
 
 
         time = time + timestep
