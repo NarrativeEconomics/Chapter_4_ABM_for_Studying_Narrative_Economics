@@ -866,7 +866,7 @@ class TraderPRZI(Trader):
         self.k = k  # number of sampling points (cf number of arms on a multi-armed-bandit, or pop-size)
         self.theta0 = 100  # threshold-function limit value
         self.m = 4  # tangent-function multiplier
-        self.strat_wait_time = 300  # how many secs do we give any one strat before switching?
+        self.strat_wait_time = 5  # how many secs do we give any one strat before switching?
         self.strat_range_min = s_min  # lower-bound on randomly-assigned strategy-value
         self.strat_range_max = s_max  # upper-bound on randomly-assigned strategy-value
         self.active_strat = 0  # which of the k strategies are we currently playing? -- start with 0
@@ -2552,17 +2552,16 @@ def market_session(sess_id, starttime, endtime, trader_spec, order_schedule, dum
     last_sec_strats = 0.0
     while time < endtime:
 
-        """============================One trader has a positive opinion ===== """
-        for tid in traders:
-            i = tid_to_i[tid]
-            B[i] = 1 if (time >= 60 * 90.0 and i == 0) else 0
-            traders[tid].input = B[i]
-        """============================One trader has a positive opinion ===== """
-
 
         # how much time left, as a percentage?
         time_left = (endtime - time) / session_duration
 
+        """============================One trader has a positive opinion ===== """
+        for tid in traders:
+            i = tid_to_i[tid]
+            B[i] = 1 if (time_left <= 0.5 and i == 0) else 0
+            traders[tid].input = B[i]
+        """============================One trader has a positive opinion ===== """
 
         [pending_cust_orders, kills] = customer_orders(time, traders, trader_stats,
                                                        order_schedule, pending_cust_orders, orders_verbose)
@@ -2603,20 +2602,20 @@ def market_session(sess_id, starttime, endtime, trader_spec, order_schedule, dum
 
 
             # ------------------------------------------------------------------------------------------------------------#
-            # ----------------------------------Update Opinions Once Every Day -------------------------------------------#
+            # ----------------------------------Update Opinions Once Every hour -------------------------------------------#
 
-            if int(time)%60 == 0 not in frames_done:
-                print("call OD")
-                X, U = opinion_dynamics(u_low, u_high, gamma, A, B, N, X0, U0)
-                X0 = X
-                U0 = U
-                for trd in traders:
-                    i = tid_to_i[trd]
-                    traders[trd].opinion = X[i]
-                    traders[trd].attention = U[i]
+        if int(time%3600) == 0 and int(time) not in frames_done:
+            print("call OD")
+            X, U = opinion_dynamics(u_low, u_high, gamma, A, B, N, X0, U0)
+            X0 = X
+            U0 = U
+            for trd in traders:
+                i = tid_to_i[trd]
+                traders[trd].opinion = X[i]
+                traders[trd].attention = U[i]
 
-                dump_opinions(time, opinion_dump, traders)
-                frames_done.add(int(time))
+            dump_opinions(time, opinion_dump, traders)
+            frames_done.add(int(time))
 
 
         time = time + timestep
@@ -2658,10 +2657,10 @@ if __name__ == "__main__":
 
     # set up common parameters for all market sessions
     # 1000 days is often good, but 3*365=1095, so may as well go for three years.
-    n_minutes = 150
+    n_hours = 150
     hours_in_a_day = 24  # how many hours the exchange operates for in a working day (e.g. NYSE = 7.5)
     start_time = 0.0
-    end_time = 60*n_minutes
+    end_time = 60*60*n_hours
     duration = end_time - start_time
 
 
@@ -2825,7 +2824,7 @@ if __name__ == "__main__":
     demand_schedule = [{'from': start_time, 'to': end_time, 'ranges': [range2], 'stepmode': 'fixed'}]
 
     # new customer orders arrive at each trader approx once every order_interval seconds
-    order_interval = 30
+    order_interval = 5
 
     # order schedule wraps up the supply/demand schedules and details of how customer orders/assignments are issued
     order_sched = {'sup': supply_schedule, 'dem': demand_schedule,
@@ -2847,7 +2846,7 @@ if __name__ == "__main__":
     while trial < (n_trials + 1):
 
         # create unique i.d. string for this trial
-        trial_id = 'bse_STAC_min%03d_i%02d_%04d' % (n_minutes, order_interval, trial)
+        trial_id = 'bse_STAC_hours%03d_i%02d_%04d' % (n_hours, order_interval, trial)
 
         # buyer_spec specifies the strategies played by buyers, and for each strategy how many such buyers to create
         buyers_spec = [('OPRDE', 30, {'k': 4, 's_min': -1.0, 's_max': +1.0})]
