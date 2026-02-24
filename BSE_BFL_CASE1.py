@@ -2196,20 +2196,19 @@ def opinion_final_complete_graph(X0, U0, B, gamma, u_low, u_high, dt, steps):
     N = X.size
 
     for _ in range(steps):
-        sumX = 0.0
-        sumX2 = 0.0
-        for i in range(N):
-            xi = X[i]
-            sumX += xi
-            sumX2 += xi * xi
+        X_old = X.copy()
+        U_old = U.copy()
+
+        sumX = float(np.sum(X_old))
+        sumX2 = float(np.sum(X_old**2))
 
         for i in range(N):
-            xi = X[i]
-            ui = U[i]
+            xi = X_old[i]
+            ui = U_old[i]
             x2 = xi * xi
 
-            AX_i = sumX - xi
-            AX2_i = sumX2 - x2
+            AX_i  = sumX - xi              # exclude self
+            AX2_i = sumX2
 
             dU = -ui + _Su_scalar(x2 + AX2_i, u_low, u_high)
             dX = -xi + ui * np.tanh(xi + gamma * AX_i) + B[i]
@@ -2221,126 +2220,39 @@ def opinion_final_complete_graph(X0, U0, B, gamma, u_low, u_high, dt, steps):
 
 
 
-def opinion_final_complete_graph_fast_inplace(X0, U0, B, gamma, u_low, u_high, dt, steps):
-    """
-    Vectorized + mostly in-place Euler simulation for a complete-graph (all-to-all) coupled system.
-
-    State variables (for i = 1..N):
-        X_i : opinion/state
-        U_i : attention state
-
-    At each time step, we approximate the ODEs with forward Euler:
-        X_i(t+dt) = X_i(t) + dt * dX_i
-        U_i(t+dt) = U_i(t) + dt * dU_i
-
-    where (complete graph coupling):
-        AX_i   = sum_{j != i} X_j
-        sumX   = sum_j X_j
-        sumX2  = sum_j X_j^2
-
-    and the model (as Besyave et.al):
-        dU_i = -U_i + S_u( X_i^2 + sumX2)
-        dX_i = -X_i + U_i * tanh( X_i + gamma * sum_{j != i} X_j ) + B_i
-    """
-
-    # Copy inputs so we don't mutate caller-owned arrays.
-    # Performance note: keeps arrays in NumPy form; operations below run in compiled code.
-    X = np.array(X0, copy=True)
-    U = np.array(U0, copy=True)
-
-    # Optional: ensure float dtype for fast ufunc/BLAS paths and predictable behavior.
-    # (If X0/U0 already float64, this does nothing meaningful.)
-    X = X.astype(np.float64, copy=False)
-    U = U.astype(np.float64, copy=False)
-    B = np.asarray(B, dtype=np.float64)
-
-    # Pre-allocate reusable temporary arrays to reduce per-step allocations.
-    # Performance note: reusing buffers avoids repeated malloc/free and helps cache behavior.
-    AX = np.empty_like(X)          # will store AX_i = sumX - X_i
-    dX = np.empty_like(X)          # will store dX_i for all i
-    tanh_arg = np.empty_like(X)    # will store (X + gamma*AX)
-    tanh_val = np.empty_like(X)    # will store tanh(tanh_arg)
+@njit
+def opinion_star_like_graph(A, X0, U0, B, gamma, u_low, u_high, dt, steps):
+    X = X0.copy()
+    U = U0.copy()
+    N = X.size
 
     for _ in range(steps):
-        # ---------- GLOBAL SUMS (complete graph / mean-field terms) ----------
+        X_old = X.copy()
+        U_old = U.copy()
 
-        # sumX = Σ_j X_j
-        # Performance: X.sum() is a single tight compiled loop over contiguous memory.
-        sumX = X.sum()
+        for i in range(N):
+            xi = X_old[i]
+            ui = U_old[i]
 
-        # sumX2 = Σ_j X_j^2
-        # Performance: dot uses optimized compiled inner product (often BLAS / SIMD).
-        sumX2 = np.dot(X, X)
+            AX_i  = np.dot(A[i, :], X_old)
+            AX2_i = np.dot(A[i, :]**2, X_old**2)
 
-        # ---------- COUPLING TERM PER AGENT ----------
+            dU = -ui + _Su_scalar(xi*xi + AX2_i, u_low, u_high)
+            dX = -xi + ui * np.tanh(xi + gamma * AX_i) + B[i]
 
-        # AX_i = Σ_{j != i} X_j = (Σ_j X_j) - X_i = sumX - X_i
-        # Vector form: AX = sumX - X
-        # Performance: broadcasting scalar subtract runs in compiled code (no Python loop).
-        np.subtract(sumX, X, out=AX)   # AX[:] = sumX - X
-
-        # ---------- U DYNAMICS ----------
-
-        # In the original code:
-        #   AX2_i = sumX2 - X_i^2
-        #   X_i^2 + AX2_i = X_i^2 + (sumX2 - X_i^2) = sumX2
-        # So the input to S_u(...) is the SAME for every i:
-        #   S_u( X_i^2 + Σ_{j != i} X_j^2 ) = S_u( Σ_j X_j^2 ) = S_u(sumX2)
-        Su = _Su_scalar(sumX2, u_low, u_high)  # scalar target activation level
-
-        # dU_i = -U_i + Su
-        # Vector form: dU = -U + Su
-        # We'll update U in-place with Euler:
-        #   U_i <- U_i + dt * dU_i
-        #
-        # Combined in-place update:
-        #   U <- U + dt * (-U + Su)
-        # Performance: in-place ops avoid allocating a new U array each step.
-        U += dt * (-U + Su)
-
-        # ---------- X DYNAMICS ----------
-
-        # tanh_arg_i = X_i + gamma * AX_i
-        #           = X_i + gamma * Σ_{j != i} X_j
-        # Vector form: tanh_arg = X + gamma * AX
-        #
-        # Performance: elementwise multiply/add are compiled ufunc loops.
-        # We compute into preallocated buffers to reduce temporaries.
-        np.multiply(gamma, AX, out=tanh_arg)     # tanh_arg[:] = gamma * AX
-        tanh_arg += X                            # tanh_arg[:] = X + gamma * AX
-
-        # tanh_val_i = tanh(tanh_arg_i)
-        # Performance: np.tanh is a compiled ufunc; runs fast, often SIMD-optimized.
-        np.tanh(tanh_arg, out=tanh_val)
-
-        # dX_i = -X_i + U_i * tanh_val_i + B_i
-        # Vector form: dX = -X + U*tanh_val + B
-        #
-        # We'll compute dX into a preallocated buffer:
-        np.multiply(U, tanh_val, out=dX)         # dX[:] = U * tanh(...)
-        dX += B                                  # dX[:] = U*tanh(...) + B
-        dX -= X                                  # dX[:] = -X + U*tanh(...) + B
-
-        # Euler update:
-        #   X_i <- X_i + dt * dX_i
-        # Performance: in-place add avoids creating a new X array each step.
-        X += dt * dX
+            U[i] = ui + dt * dU
+            X[i] = xi + dt * dX
 
     return X, U
 
 
-def opinion_dynamics(u_low, u_high, gamma, A, B, N, X0, U0, dt=0.1, total_time=1.0):
-    X0 = np.asarray(X0, dtype=np.float64)
-    U0 = np.asarray(U0, dtype=np.float64)
-    B  = np.asarray(B,  dtype=np.float64)
-    gamma = float(gamma)
-    u_low = float(u_low)
-    u_high = float(u_high)
+def opinion_dynamics(u_low, u_high, gamma, A, B, N, X0, U0, dt=0.01, total_time=1.0):
     dt = float(dt)
     total_time = float(total_time)
 
     steps = int(total_time / dt)
-    return opinion_final_complete_graph_fast_inplace(X0, U0, B, gamma, u_low, u_high, dt, steps)
+    return opinion_final_complete_graph(X0, U0, B, gamma, u_low, u_high, dt, steps)
+    #return opinion_star_like_graph(A, X0, U0, B, gamma, u_low, u_high, dt, steps)
 
 
 
@@ -2912,7 +2824,7 @@ def market_session(sess_id, starttime, endtime, trader_spec, order_schedule, dum
 
 if __name__ == "__main__":
 
-    price_offset_filename = 'offset_BTC_USD_20250211.csv'
+    price_offset_filename = '../../../Downloads/offset_BTC_USD_20250211.csv'
 
     # if called from the command line with one argument, the first argument is the price offset filename
     if len(sys.argv) > 1:
@@ -2921,7 +2833,7 @@ if __name__ == "__main__":
     # set up common parameters for all market sessions
     # 1000 days is often good, but 3*365=1095, so may as well go for three years.
 
-    hours = 15  # how many hours the exchange operates for in a working day (e.g. NYSE = 7.5)
+    hours = 150  # how many hours the exchange operates for in a working day (e.g. NYSE = 7.5)
     start_time = 0.0
     end_time = 60.0 *60.0 * hours
     duration = end_time - start_time
@@ -3101,13 +3013,14 @@ if __name__ == "__main__":
     # if verbose = True, print a running commentary describing what's going on.
     verbose = False
 
-    # n_trials is how many trials (i.e. market sessions) to run in total
-    n_trials = 1
+    trial_start = 1
+    trial_end = 1
+    if len(sys.argv) >= 3:
+        trial_start = int(sys.argv[1])
+        trial_end = int(sys.argv[2])
 
-    # n_recorded is how many trials (i.e. market sessions) to write full data-files for
-    n_trials_recorded = 5
-
-    trial = 1
+    trial = trial_start
+    n_trials = trial_end
 
     while trial < (n_trials + 1):
 
@@ -3127,13 +3040,9 @@ if __name__ == "__main__":
         # trader_spec wraps up the specifications for the buyers, sellers, and proptraders
         traders_spec = {'sellers': sellers_spec, 'buyers': buyers_spec}
 
-        if trial > n_trials_recorded:
-            # switch off recording of detailed data-files
-            dump_flags = {'dump_blotters': False, 'dump_lobs': False, 'dump_strats': False,
-                          'dump_avgbals': False, 'dump_tape': False, 'dump_opinions': False}
-        else:
-            # we're still recording all the required data-files
-            dump_flags = {'dump_blotters': True, 'dump_lobs': True, 'dump_strats': True,
+
+        # we're still recording all the required data-files
+        dump_flags = {'dump_blotters': True, 'dump_lobs': True, 'dump_strats': True,
                           'dump_avgbals': True, 'dump_tape': True, 'dump_opinions': True}
 
         # simulate the market session
